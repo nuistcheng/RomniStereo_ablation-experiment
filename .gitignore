@@ -1,0 +1,30 @@
+# Python缓存
+__pycache__/
+*.pyc
+*.pyo
+
+# 备份文件
+*.bak
+
+# 模型权重
+checkpoints/
+*.pth
+*.ckpt
+*.pt
+
+# 训练日志
+runs/
+
+# 数据集
+*.tar.gz
+*.tar
+*.zip
+*.bin
+
+# IDE
+.idea/
+
+# 下载脚本产生的临时文件
+omnidata.tar.gz
+*.tar.gz
+*.hwd
