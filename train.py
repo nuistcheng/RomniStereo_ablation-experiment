@@ -67,9 +67,24 @@ parser.add_argument('--corr_radius', type=int, default=4, help="width of the cor
 parser.add_argument('--mixed_precision', action='store_true', help='use mixed precision')
 parser.add_argument('--fix_bn', action='store_true', help='fix batch normalization')
 
+# 消融实验：AAAF 各组件开关（传 False 可单独关闭对应组件）
+def _str2bool(v):
+    return str(v).lower() not in ('false', '0', 'no', 'n')
+
+parser.add_argument('--use_sae',  type=_str2bool, default=True,
+                    help='是否使用球面角度编码（SAE），消融时传 False 关闭')
+parser.add_argument('--use_attn', type=_str2bool, default=True,
+                    help='是否使用角度感知通道/空间注意力（Attn），消融时传 False 关闭')
+parser.add_argument('--use_ihde', type=_str2bool, default=True,
+                    help='是否使用迭代历史深度编码器（IHDE），消融时传 False 关闭')
+
 # training options
+parser.add_argument('--seed', type=int, default=None, help='全局随机种子，用于保证可复现性')
 parser.add_argument('--total_epochs', type=int, default=30, help='total epochs of training')
-parser.add_argument('--batch_size', type=int, default=1, help='batch size')
+parser.add_argument('--batch_size', type=int, default=1, help='逻辑 batch size（等效 batch size）')
+parser.add_argument('--accum_steps', type=int, default=1,
+                    help='梯度累积步数，物理 batch_size = batch_size // accum_steps；'
+                         '设为 2 时以物理 bs=8 累积 2 步等效逻辑 bs=16，显存减半')
 parser.add_argument('--train_iters', type=int, default=12,
                     help="number of updates to the disparity field in each forward pass.")
 parser.add_argument('--valid_iters', type=int, default=12,
@@ -107,9 +122,14 @@ opts.net_opts.corr_levels = args.corr_levels
 opts.net_opts.corr_radius = args.corr_radius
 opts.net_opts.mixed_precision = args.mixed_precision
 opts.net_opts.fix_bn = args.fix_bn
+opts.net_opts.use_sae  = args.use_sae
+opts.net_opts.use_attn = args.use_attn
+opts.net_opts.use_ihde = args.use_ihde
 
+opts.seed = args.seed
 opts.total_epochs = args.total_epochs
 opts.batch_size = args.batch_size
+opts.accum_steps = args.accum_steps
 opts.train_iters = args.train_iters
 opts.valid_iters = args.valid_iters
 opts.lr = args.lr
@@ -135,9 +155,13 @@ def train(epoch_total, load_state):
         data = MultiDataset(opts.dbname, opts.data_opts, db_root=opts.db_root)
     else:
         data = Dataset(opts.dbname[0], opts.data_opts, db_root=opts.db_root)
-    dbloader = torch.utils.data.DataLoader(data, batch_size=opts.batch_size,
+
+    accum_steps = opts.accum_steps                       # 梯度累积步数
+    phys_batch  = opts.batch_size // accum_steps         # 每次 forward 的物理 batch size
+    dbloader = torch.utils.data.DataLoader(data, batch_size=phys_batch,
                                            pin_memory=True, shuffle=True,
                                            num_workers=0, drop_last=True)
+    # total_num_steps 以逻辑 batch（optimizer step）为单位，与原始语义一致
     total_num_steps = len(data)*opts.total_epochs//opts.batch_size
 
     net = nn.DataParallel(ROmniStereo(opts.net_opts)).cuda()
@@ -192,39 +216,50 @@ def train(epoch_total, load_state):
         train_loss = 0
         epoch_loss = 0
         LOG_INFO('\nEpoch: %d' % epoch)
-        # acc_total=0
+        optimizer.zero_grad()
+        accum_loss = 0.0   # 当前累积窗口内的 loss 之和（用于日志）
+        start_time = time.time()
+
         for step, data_blob in enumerate(dbloader):
-            start_time = time.time()
             imgs, gt, valid, raw_imgs = data_blob
 
             imgs = [img.cuda() for img in imgs]
             valid = valid.cuda()
             gt = gt.cuda()
 
-            # net.zero_grad()
-            optimizer.zero_grad()
-
             predictions = net(imgs, grids, opts.train_iters)
 
             loss = sequence_loss(predictions, gt.unsqueeze(1), valid.unsqueeze(1))
 
-            train_loss += loss.data
+            # 归一化 loss：使梯度累积等效于完整逻辑 batch 的梯度
+            scaled_loss = loss / accum_steps
+            accum_loss += loss.data
 
-            epoch_loss = train_loss / (step + 1)
+            scaler.scale(scaled_loss).backward()
 
-            if step % 200 == 0:
-                LOG_INFO("Iter %d training loss = %.3f, average training loss for every step = %.3f, \
-                    time = %.2f" % (total_iters, loss, epoch_loss, time.time() - start_time))
-                writer.add_scalar("train/loss", loss, total_iters)
+            # 每 accum_steps 步（或最后一步）执行一次参数更新
+            is_last_step = (step + 1) == len(dbloader)
+            if (step + 1) % accum_steps == 0 or is_last_step:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(net.parameters(), 1.0)
+                scaler.step(optimizer)
+                scheduler.step()
+                scaler.update()
+                optimizer.zero_grad()
 
-            scaler.scale(loss).backward()
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(net.parameters(), 1.0)
-            scaler.step(optimizer)
-            scheduler.step()
-            scaler.update()
+                # 以 optimizer step 为单位记录日志（与原始 total_iters 语义一致）
+                eff_loss = accum_loss / accum_steps
+                accum_loss = 0.0
+                train_loss += eff_loss
+                epoch_loss = train_loss / (total_iters - len(data)*start_epoch//opts.batch_size + 1)
 
-            total_iters += 1
+                if total_iters % 200 == 0:
+                    LOG_INFO("Iter %d training loss = %.3f, average training loss for every step = %.3f, \
+                    time = %.2f" % (total_iters, eff_loss, epoch_loss, time.time() - start_time))
+                    writer.add_scalar("train/loss", eff_loss, total_iters)
+                    start_time = time.time()
+
+                total_iters += 1
 
         # save
         savefilename = opts.model_dir + '/%s_e%d.pth' % (opts.name, epoch)
@@ -274,6 +309,14 @@ def train(epoch_total, load_state):
             (mean_errors[0], mean_errors[1], mean_errors[2], mean_errors[3], mean_errors[4]))
 
 def main():
+    # 设置全局随机种子以保证可复现性
+    if opts.seed is not None:
+        random.seed(opts.seed)
+        np.random.seed(opts.seed)
+        torch.manual_seed(opts.seed)
+        torch.cuda.manual_seed_all(opts.seed)
+        LOG_INFO('随机种子已设置为 %d' % opts.seed)
+
     load_state = opts.snapshot_path is not None or opts.pretrain_path is not None
     train(opts.total_epochs, load_state)
 

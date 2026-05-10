@@ -36,7 +36,14 @@ class ROmniStereo(torch.nn.Module):
         hidden_dim = self.opts.base_channel*2
         self.volume_gen = Generator(self.opts)
         self.state_conv = Conv2D(context_dim, hidden_dim, 1, pad=0, relu=False)
-        self.update_block = UpdateBlock(self.opts, hidden_dim=hidden_dim, input_dim=context_dim)
+        self.update_block = UpdateBlock(
+            self.opts,
+            hidden_dim = hidden_dim,
+            input_dim  = context_dim,
+            use_sae    = getattr(self.opts, 'use_sae',  True),
+            use_attn   = getattr(self.opts, 'use_attn', True),
+            use_ihde   = getattr(self.opts, 'use_ihde', True),
+        )
 
     def freeze_bn(self):
         for m in self.modules():
